@@ -10,7 +10,7 @@ import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
 import torch.optim as optim
 import torch.utils.data
-from model.dataset import VideoDataSet_pn
+from model.dataset import VideoDataSet_pn, nb_unpad
 from model.snerv import SNeRV
 from utils import *
 from torch.utils.data import Subset
@@ -20,7 +20,11 @@ from torchvision.utils import save_image
 from pytorch_wavelets import DWT
 
 
+import nb_hook
+
+
 def main():
+    nb_hook.install()
     parser = argparse.ArgumentParser()
     
     parser.add_argument('--model', type=str, default='snerv',choices=['snerv'], help='')
@@ -32,6 +36,7 @@ def main():
     parser.add_argument('--data_split', type=str, default='1_1_1', 
         help='Valid_train/total_train/all data split, e.g., 18_19_20 means for every 20 samples, the first 19 samples is full train set, and the first 18 samples is chose currently')
     parser.add_argument('--crop_list', type=str, default='640_1280', help='video crop size',)
+    parser.add_argument('--pad_hw', type=str, default='', help='bench: reflect-pad frames to H_W after crop/resize (cropped back for eval)')
     parser.add_argument('--resize_list', type=str, default='-1', help='video resize size',)
     parser.add_argument('--frame_gap', type=int, default=1, help="frame gap for interpolation")
     parser.add_argument('--data_len', type=int, default=None, help="length of dataset")
@@ -259,6 +264,26 @@ def train(local_rank, args):
             args.start_epoch = checkpoint['epoch'] 
         args.start_epoch = max(args.start_epoch, 0)
 
+    nb_hook.count_exit(args.total_param * 1e6)
+    if nb_hook.EVAL_DIR:
+        # wall-clock bench eval: reconstruct through encoder+decoder; time the decoder from stored embeddings
+        frames = torch.stack([full_dataset[j]['img'] for j in range(len(full_dataset))])
+        hw = full_dataset.cache[0].shape[-2:]
+
+        def decode(idx):
+            # one frame per call: SNeRV normalises the wavelet embedding by min/max over the batch
+            return nb_unpad(torch.cat([model(frames[j:j + 1].cuda())[0] for j in idx.tolist()]), hw)
+
+        def decode_only():
+            embs = [model(frames[j:j + 1].cuda())[1][0] for j in range(len(frames))]
+            feats = torch.cat([e[0] for e in embs])
+            # batched decode shares one normaliser; values do not affect speed
+            return lambda idx: nb_unpad(model(None, input_embed=[feats[idx], embs[0][1]])[0], hw)
+
+        nb_hook.evaluate(model, decode, frame_dir=args.data_path, device=torch.device('cuda'),
+                         decode_only=decode_only, n_params=args.total_param * 1e6)
+        return
+
     if args.eval_only:
         print_str = 'Evaluation ... \n {} Results for checkpoint: {}\n'.format(datetime.now().strftime('%Y_%m_%d_%H_%M_%S'), args.weight)
         results_list, hw = evaluate(model, full_dataloader, local_rank, args, args.dump_vis, huffman_coding=True)
@@ -288,6 +313,7 @@ def train(local_rank, args):
         # iterate over dataloader
         device = next(model.parameters()).device
         for i, sample in enumerate(train_dataloader):
+            nb_hook.poll(model.state_dict, epoch)
             for key, value in sample.items():
                 sample[key] = sample[key].to(device)
 
@@ -336,6 +362,11 @@ def train(local_rank, args):
             with open('{}/rank0.txt'.format(args.outf), 'a') as f:
                 f.write(print_str + '\n')
 
+        nb_hook.epoch_end(epoch + 1, len(train_dataset))
+        if nb_hook.ACTIVE:
+            # wall-clock bench: no in-loop eval or checkpoint I/O; snapshots come from nb_hook
+            continue
+
         # evaluation
         if (epoch + 1) % args.eval_freq == 0 or (args.epochs - epoch) in [1, 3, 5]:
             results_list, hw = evaluate(model, full_dataloader, local_rank, args, 
@@ -370,6 +401,7 @@ def train(local_rank, args):
                 if best_metric_list[0]==results_list[0]:
                     torch.save(save_checkpoint, f'{args.outf}/model_best.pth')
 
+    nb_hook.final(model.state_dict, args.epochs)
     if local_rank in [0, None]:
         print(f"Training complete in: {str(datetime.now() - start)}")
 
