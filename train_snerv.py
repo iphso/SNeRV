@@ -264,7 +264,7 @@ def train(local_rank, args):
             args.start_epoch = checkpoint['epoch'] 
         args.start_epoch = max(args.start_epoch, 0)
 
-    nb_hook.count_exit(args.total_param * 1e6)
+    nb_hook.count_exit(sum(v.numel() for k, v in model.named_parameters() if not k.startswith('encoder')) + embed_param)
     if nb_hook.EVAL_DIR:
         # wall-clock bench eval: reconstruct through encoder+decoder; time the decoder from stored embeddings
         frames = torch.stack([full_dataset[j]['img'] for j in range(len(full_dataset))])
@@ -281,7 +281,7 @@ def train(local_rank, args):
             return lambda idx: nb_unpad(model(None, input_embed=[feats[idx], embs[0][1]])[0], hw)
 
         nb_hook.evaluate(model, decode, frame_dir=args.data_path, device=torch.device('cuda'),
-                         decode_only=decode_only, n_params=args.total_param * 1e6)
+                         decode_only=decode_only, n_params=(sum(v.numel() for k, v in model.named_parameters() if not k.startswith('encoder')) + embed_param))
         return
 
     if args.eval_only:
